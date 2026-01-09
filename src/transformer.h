@@ -1,51 +1,65 @@
 #pragma once
-
 #include "linear.h"
 #include <cmath>
 #include <vector>
 
+using std::vector;
 using std::sqrt;
 using std::tanh;
 using std::exp;
-using std::vector;
 
 inline float gelu(float x) {
-    // smooth nonlinearity used in many transformers
     float x3 = x * x * x;
     return 0.5f * x * (1.0f + tanh(0.79788456f * (x + 0.044715f * x3)));
 }
 
-// kv cache for one block
-// stores concatenated heads in hiddenDim layout: [pos, hiddenDim]
+//  RMSNorm 
+struct rmsNorm {
+    int dim;
+    float eps;
+    vector<float> weight;
+
+    rmsNorm() : dim(0), eps(1e-6f) {}
+    rmsNorm(int d) : dim(d), eps(1e-6f), weight(d, 1.0f) {}
+
+    tensor forward(const tensor& x) const {
+        tensor out(1, dim);
+        float meanSq = 0.0f;
+        for (int i = 0; i < dim; i++)
+            meanSq += x(0, i) * x(0, i);
+        meanSq /= dim;
+
+        float scale = 1.0f / sqrt(meanSq + eps);
+        for (int i = 0; i < dim; i++)
+            out(0, i) = x(0, i) * scale * weight[i];
+        return out;
+    }
+
+    void loadWeights(const string& path) {
+        loadBinary(path, weight.data(), dim);
+    }
+};
+
+//  KV Cache 
 struct kvCache {
-    int maxSeqLen;
-    int hiddenDim;
+    int maxLen;
+    int dim;
+    tensor k;
+    tensor v;
 
-    tensor k; // [maxSeqLen, hiddenDim]
-    tensor v; // [maxSeqLen, hiddenDim]
+    kvCache(int m, int d) : maxLen(m), dim(d), k(m, d), v(m, d) {}
 
-    kvCache() : maxSeqLen(0), hiddenDim(0) {}
-
-    kvCache(int maxLen, int dim)
-        : maxSeqLen(maxLen),
-          hiddenDim(dim),
-          k(maxLen, dim),
-          v(maxLen, dim) {}
-
-    void writeKv(int pos, const tensor& kToken, const tensor& vToken) {
-        // kToken/vToken are [1, hiddenDim]
-        for (int i = 0; i < hiddenDim; i++) {
-            k(pos, i) = kToken(0, i);
-            v(pos, i) = vToken(0, i);
+    void write(int pos, const tensor& kt, const tensor& vt) {
+        for (int i = 0; i < dim; i++) {
+            k(pos, i) = kt(0, i);
+            v(pos, i) = vt(0, i);
         }
     }
 };
 
-// single transformer block with autoregressive forward using kv cache
+//  Transformer Block 
 struct transformerBlock {
-    int hiddenDim;
-    int numHeads;
-    int headDim;
+    int dim;
 
     linear qProj;
     linear kProj;
@@ -55,89 +69,53 @@ struct transformerBlock {
     linear fc1;
     linear fc2;
 
-    transformerBlock() : hiddenDim(0), numHeads(0), headDim(0) {}
+    rmsNorm attnNorm;
+    rmsNorm mlpNorm;
 
-    transformerBlock(int dim, int heads)
-        : hiddenDim(dim),
-          numHeads(heads),
-          headDim(dim / heads),
-          qProj(dim, dim),
-          kProj(dim, dim),
-          vProj(dim, dim),
-          oProj(dim, dim),
-          fc1(dim, 4 * dim),
-          fc2(4 * dim, dim) {}
+    transformerBlock(int d)
+        : dim(d),
+          qProj(d, d),
+          kProj(d, d),
+          vProj(d, d),
+          oProj(d, d),
+          fc1(d, 4 * d),
+          fc2(4 * d, d),
+          attnNorm(d),
+          mlpNorm(d) {}
 
-    tensor forwardToken(const tensor& xToken, int pos, kvCache& cache) const {
-        // xToken: [1, hiddenDim] for the current token only
-        // pos: position index in the sequence
-        // cache holds past keys/values at [0..pos]
+    tensor forwardToken(const tensor& x, int pos, kvCache& cache) {
+        tensor xn = attnNorm.forward(x);
 
-        tensor q = qProj.forward(xToken); // [1, hiddenDim]
-        tensor k = kProj.forward(xToken); // [1, hiddenDim]
-        tensor v = vProj.forward(xToken); // [1, hiddenDim]
+        tensor q = qProj.forward(xn);
+        tensor k = kProj.forward(xn);
+        tensor v = vProj.forward(xn);
 
-        cache.writeKv(pos, k, v);
+        cache.write(pos, k, v);
 
-        tensor attnOut(1, hiddenDim);
+        tensor attnOut(1, dim);
+        for (int s = 0; s <= pos; s++) {
+            float score = 0.0f;
+            for (int i = 0; i < dim; i++)
+                score += q(0, i) * cache.k(s, i);
 
-        // causal attention is implicit: we only attend to s <= pos
-        // compute per-head softmax weights over past positions
-        for (int h = 0; h < numHeads; h++) {
-
-            float maxScore = -1e30f;
-            vector<float> scores(pos + 1);
-
-            // scores[s] = (q dot k_s) / sqrt(d)
-            for (int s = 0; s <= pos; s++) {
-                float dot = 0.0f;
-                for (int i = 0; i < headDim; i++) {
-                    int idx = h * headDim + i;
-                    dot += q(0, idx) * cache.k(s, idx);
-                }
-                float score = dot / sqrt((float)headDim);
-                scores[s] = score;
-                if (score > maxScore) maxScore = score;
-            }
-
-            // stable softmax
-            float denom = 0.0f;
-            for (int s = 0; s <= pos; s++) {
-                scores[s] = exp(scores[s] - maxScore);
-                denom += scores[s];
-            }
-            float invDenom = 1.0f / (denom + 1e-9f);
-
-            // head output = sum_s p[s] * v_s
-            for (int d = 0; d < headDim; d++) {
-                float acc = 0.0f;
-                for (int s = 0; s <= pos; s++) {
-                    float p = scores[s] * invDenom;
-                    acc += p * cache.v(s, h * headDim + d);
-                }
-                attnOut(0, h * headDim + d) = acc;
-            }
+            for (int i = 0; i < dim; i++)
+                attnOut(0, i) += score * cache.v(s, i);
         }
 
-        // output projection
-        tensor attnProj = oProj.forward(attnOut);
+        tensor proj = oProj.forward(attnOut);
 
-        // residual 1: x + attn(x)
-        tensor resid1(1, hiddenDim);
-        for (int i = 0; i < hiddenDim; i++) {
-            resid1(0, i) = xToken(0, i) + attnProj(0, i);
-        }
+        tensor r1(1, dim);
+        for (int i = 0; i < dim; i++)
+            r1(0, i) = x(0, i) + proj(0, i);
 
-        // mlp: fc1 -> gelu -> fc2
-        tensor hidden = fc1.forward(resid1);
-        for (auto& val : hidden.data) val = gelu(val);
-        tensor mlpOut = fc2.forward(hidden);
+        tensor hn = mlpNorm.forward(r1);
+        tensor h = fc1.forward(hn);
+        for (auto& v : h.data) v = gelu(v);
+        tensor m = fc2.forward(h);
 
-        // residual 2: resid1 + mlp(resid1)
-        tensor out(1, hiddenDim);
-        for (int i = 0; i < hiddenDim; i++) {
-            out(0, i) = resid1(0, i) + mlpOut(0, i);
-        }
+        tensor out(1, dim);
+        for (int i = 0; i < dim; i++)
+            out(0, i) = r1(0, i) + m(0, i);
 
         return out;
     }

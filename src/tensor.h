@@ -4,8 +4,7 @@
 
 using std::vector;
 
-// simple 2d tensor, cpu only
-// row-major [rows, cols]
+// simple 2d tensor (row-major)
 struct tensor {
     int rows;
     int cols;
@@ -22,9 +21,7 @@ struct tensor {
         return data[i * cols + j];
     }
 
-    int numel() const { return rows * cols; }
-
-    void fill(float value) {
-        for (auto& x : data) x = value;
+    void fill(float v) {
+        for (auto& x : data) x = v;
     }
 };
