@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import os
 
-dim = 64
+dim = 128
 vocab = 256
 maxLen = 256
 
@@ -62,10 +62,11 @@ class tinyLM(nn.Module):
     def __init__(self):
         super().__init__()
         self.block = tinyBlock(dim)
+        self.embed = nn.Embedding(vocab, dim)
         self.lmHead = nn.Linear(dim, vocab)
 
     def forward(self, tokenId, cacheK, cacheV, pos):
-        x = torch.full((1, dim), tokenId / 255.0)
+        x = self.embed(torch.tensor([tokenId]))
         h = self.block(x, cacheK, cacheV, pos)
         return self.lmHead(h)
 
@@ -78,6 +79,7 @@ def dump(tensor, name):
         os.path.join(exportDir, name)
     )
 
+dump(model.embed.weight, "embed.bin")
 
 dump(model.block.qProj.weight, "qProj.bin")
 dump(model.block.qProj.bias,   "qProjBias.bin")
