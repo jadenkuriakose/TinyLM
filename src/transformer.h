@@ -63,19 +63,71 @@ struct transformerBlock {
     linear fc1, fc2;
     rmsNorm attnNorm, mlpNorm;
 
-    transformerBlock() : dim(0) {}
+    int ropeMaxLen;
+    int ropeDim;
+    vector<float> ropeSin;
+    vector<float> ropeCos;
+
+    transformerBlock() : dim(0), ropeMaxLen(0), ropeDim(0) {}
     transformerBlock(int d)
         : dim(d),
           qProj(d, d), kProj(d, d), vProj(d, d), oProj(d, d),
           fc1(d, 4 * d), fc2(4 * d, d),
-          attnNorm(d), mlpNorm(d) {}
+          attnNorm(d), mlpNorm(d),
+          ropeMaxLen(0), ropeDim(0) {}
+
+    void buildRoPE(int maxLen) {
+        ropeMaxLen = maxLen;
+        ropeDim = dim;
+        int half = ropeDim / 2;
+        ropeSin.assign((size_t)ropeMaxLen * (size_t)half, 0.0f);
+        ropeCos.assign((size_t)ropeMaxLen * (size_t)half, 0.0f);
+
+        float base = 10000.0f;
+        for (int p = 0; p < ropeMaxLen; p++) {
+            for (int i = 0; i < half; i++) {
+                float exponent = (2.0f * (float)i) / (float)ropeDim;
+                float invFreq = powf(base, -exponent);
+                float ang = (float)p * invFreq;
+                ropeSin[(size_t)p * (size_t)half + (size_t)i] = sinf(ang);
+                ropeCos[(size_t)p * (size_t)half + (size_t)half + (size_t)i - (size_t)half] = 0.0f;
+                ropeCos[(size_t)p * (size_t)half + (size_t)i] = cosf(ang);
+            }
+        }
+    }
+
+    void applyRoPE(tensor& t, int pos) {
+        if (ropeMaxLen <= 0 || ropeDim != dim) return;
+        if (pos < 0) return;
+        if (pos >= ropeMaxLen) pos = ropeMaxLen - 1;
+        int half = dim / 2;
+        const float* s = ropeSin.data() + (size_t)pos * (size_t)half;
+        const float* c = ropeCos.data() + (size_t)pos * (size_t)half;
+
+        for (int i = 0; i < half; i++) {
+            float x0 = t(0, 2 * i + 0);
+            float x1 = t(0, 2 * i + 1);
+            float cc = c[i];
+            float ss = s[i];
+            t(0, 2 * i + 0) = x0 * cc - x1 * ss;
+            t(0, 2 * i + 1) = x0 * ss + x1 * cc;
+        }
+    }
 
     tensor forwardToken(const tensor& x, int pos, kvCache& cache) {
+        if (ropeMaxLen != cache.maxLen || ropeDim != dim) buildRoPE(cache.maxLen);
+
         tensor xNorm = attnNorm.forward(x);
 
         tensor q = qProj.forward(xNorm);
         tensor k = kProj.forward(xNorm);
         tensor v = vProj.forward(xNorm);
+
+        if ((dim % 2) == 0) {
+            applyRoPE(q, pos);
+            applyRoPE(k, pos);
+        }
+
         cache.write(pos, k, v);
 
         tensor attnOut(1, dim);

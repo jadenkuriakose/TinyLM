@@ -1,159 +1,174 @@
 import os
 import math
 import time
+import json
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sentencepiece as spm
+from pathlib import Path
+from tqdm import tqdm
 
-dim = 128
-vocab = 256
+dim = 192
+nLayers = 16
 maxLen = 256
-nLayers = 4
 
-batchSize = 16
-seqLen = 256
+batchSize = 32
+seqLen = 128
 lr = 3e-4
-steps = 20000
-logEvery = 100
+steps = 8000
 
-dataPath = os.path.join(os.path.dirname(__file__), "..", "data", "train.txt")
-outDir = os.path.join(os.path.dirname(__file__), "..", "weights")
+vocabSize = 4096
 
-os.makedirs(outDir, exist_ok=True)
+rootDir = Path(__file__).resolve().parent.parent
+dataPath = rootDir / "data" / "train.txt"
+tokPath = rootDir / "tokenizer" / "tinyLM.model"
+tokensPath = rootDir / "data" / "tokens.bin"
+weightsDir = rootDir / "weights"
 
-def readBytes(path):
-    with open(path, "rb") as f:
-        return np.frombuffer(f.read(), dtype=np.uint8)
+weightsDir.mkdir(exist_ok=True)
+(rootDir / "data").mkdir(exist_ok=True)
 
-data = readBytes(dataPath)
-if len(data) < seqLen + 2:
-    raise RuntimeError("data too small, put more text in data/train.txt")
-
-def getBatch():
-    ix = np.random.randint(0, len(data) - seqLen - 1, size=(batchSize,))
-    x = np.stack([data[i:i+seqLen] for i in ix], axis=0)
-    y = np.stack([data[i+1:i+seqLen+1] for i in ix], axis=0)
-    return torch.from_numpy(x).long(), torch.from_numpy(y).long()
+# -----------------------------
+# Model
+# -----------------------------
 
 class rmsNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, d):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+        self.w = nn.Parameter(torch.ones(d))
 
     def forward(self, x):
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms * self.weight
+        return x / (x.pow(2).mean(-1, keepdim=True).sqrt() + 1e-6) * self.w
 
-class tinyBlock(nn.Module):
-    def __init__(self, dim):
+
+class block(nn.Module):
+    def __init__(self, d):
         super().__init__()
-        self.attnNorm = rmsNorm(dim)
-        self.qProj = nn.Linear(dim, dim)
-        self.kProj = nn.Linear(dim, dim)
-        self.vProj = nn.Linear(dim, dim)
-        self.oProj = nn.Linear(dim, dim)
+        self.n1 = rmsNorm(d)
+        self.q = nn.Linear(d, d)
+        self.k = nn.Linear(d, d)
+        self.v = nn.Linear(d, d)
+        self.o = nn.Linear(d, d)
 
-        self.mlpNorm = rmsNorm(dim)
-        self.fc1 = nn.Linear(dim, 4 * dim)
-        self.fc2 = nn.Linear(4 * dim, dim)
-
-        self.gelu = nn.GELU()
+        self.n2 = rmsNorm(d)
+        self.fc1 = nn.Linear(d, 4 * d)
+        self.fc2 = nn.Linear(4 * d, d)
 
     def forward(self, x):
-        b, t, d = x.shape
-        xNorm = self.attnNorm(x)
+        b,t,d = x.shape
+        h = self.n1(x)
 
-        q = self.qProj(xNorm)
-        k = self.kProj(xNorm)
-        v = self.vProj(xNorm)
+        q = self.q(h)
+        k = self.k(h)
+        v = self.v(h)
 
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(d)
-        mask = torch.tril(torch.ones(t, t, device=x.device))
-        scores = scores.masked_fill(mask == 0, -1e9)
+        att = (q @ k.transpose(-2,-1)) / math.sqrt(d)
+        mask = torch.tril(torch.ones(t,t,device=x.device))
+        att = att.masked_fill(mask==0, -1e9)
+        att = att.softmax(-1)
 
-        probs = F.softmax(scores, dim=-1)
-        attn = probs @ v
+        x = x + self.o(att @ v)
 
-        x = x + self.oProj(attn)
-
-        hNorm = self.mlpNorm(x)
-        h = self.gelu(self.fc1(hNorm))
-        x = x + self.fc2(h)
-
+        h = self.n2(x)
+        x = x + self.fc2(F.gelu(self.fc1(h)))
         return x
 
-class tinyLM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embed = nn.Embedding(vocab, dim)
-        self.blocks = nn.ModuleList([tinyBlock(dim) for _ in range(nLayers)])
-        self.lmHead = nn.Linear(dim, vocab)
 
-    def forward(self, idx, targets=None):
-        x = self.embed(idx)
+class tinyLM(nn.Module):
+    def __init__(self, vocab):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim)
+        self.blocks = nn.ModuleList([block(dim) for _ in range(nLayers)])
+        self.head = nn.Linear(dim, vocab)
+
+    def forward(self, x, y=None):
+        x = self.emb(x)
         for b in self.blocks:
             x = b(x)
-        logits = self.lmHead(x)
-
+        logits = self.head(x)
         loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, vocab), targets.view(-1))
+        if y is not None:
+            loss = F.cross_entropy(logits.view(-1,logits.size(-1)), y.view(-1))
         return logits, loss
 
-def dump(t, path):
-    t.detach().cpu().numpy().astype("float32").tofile(path)
 
-def exportWeights(m):
-    dump(m.embed.weight, os.path.join(outDir, "embed.bin"))
-    dump(m.lmHead.weight, os.path.join(outDir, "lmHead.bin"))
-    dump(m.lmHead.bias,   os.path.join(outDir, "lmHeadBias.bin"))
+# -----------------------------
+# Token Encoding
+# -----------------------------
 
-    for i, b in enumerate(m.blocks):
-        layerDir = os.path.join(outDir, f"layer{i}")
-        os.makedirs(layerDir, exist_ok=True)
+def buildTokens(reencode):
+    if tokensPath.exists() and not reencode:
+        print("tokens.bin found")
+        return
 
-        dump(b.qProj.weight, os.path.join(layerDir, "qProj.bin"))
-        dump(b.qProj.bias,   os.path.join(layerDir, "qProjBias.bin"))
+    print("building tokens.bin")
 
-        dump(b.kProj.weight, os.path.join(layerDir, "kProj.bin"))
-        dump(b.kProj.bias,   os.path.join(layerDir, "kProjBias.bin"))
+    sp = spm.SentencePieceProcessor()
+    sp.load(str(tokPath))
 
-        dump(b.vProj.weight, os.path.join(layerDir, "vProj.bin"))
-        dump(b.vProj.bias,   os.path.join(layerDir, "vProjBias.bin"))
+    if tokensPath.exists():
+        tokensPath.unlink()
 
-        dump(b.oProj.weight, os.path.join(layerDir, "oProj.bin"))
-        dump(b.oProj.bias,   os.path.join(layerDir, "oProjBias.bin"))
+    out = open(tokensPath,"ab")
+    with open(dataPath,"r",encoding="utf-8") as f:
+        for i,line in enumerate(f):
+            ids = sp.encode(line.strip(), out_type=int)
+            np.array(ids,dtype=np.int32).tofile(out)
+            if i % 1000 == 0:
+                print("encoded", i)
+    out.close()
 
-        dump(b.fc1.weight, os.path.join(layerDir, "fc1.bin"))
-        dump(b.fc1.bias,   os.path.join(layerDir, "fc1Bias.bin"))
+    assert tokensPath.exists()
+    print("tokens.bin created")
 
-        dump(b.fc2.weight, os.path.join(layerDir, "fc2.bin"))
-        dump(b.fc2.bias,   os.path.join(layerDir, "fc2Bias.bin"))
 
-        dump(b.attnNorm.weight, os.path.join(layerDir, "attnNorm.bin"))
-        dump(b.mlpNorm.weight,  os.path.join(layerDir, "mlpNorm.bin"))
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--reencode", action="store_true")
+    ap.add_argument("--cpu", action="store_true")
+    args = ap.parse_args()
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-model = tinyLM().to(device)
-opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    buildTokens(args.reencode)
 
-t0 = time.time()
-for step in range(1, steps + 1):
-    x, y = getBatch()
-    x = x.to(device)
-    y = y.to(device)
+    mem = np.memmap(tokensPath, dtype=np.int32, mode="r")
+    print("tokens:", mem.shape[0])
 
-    i, loss = model(x, y)
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    opt.step()
+    device = "cpu"
+    if not args.cpu and torch.backends.mps.is_available():
+        device="mps"
 
-    if step % logEvery == 0:
-        dt = time.time() - t0
-        print(f"step {step}/{steps} loss {loss.item():.4f} time {dt:.1f}s")
-        t0 = time.time()
+    model = tinyLM(vocabSize).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
-exportWeights(model)
-print("training complete, weights exported")
+    pbar = tqdm(total=steps)
+
+    for s in range(1,steps+1):
+        ix = np.random.randint(0, mem.shape[0]-seqLen-1, size=batchSize)
+        x = np.stack([mem[i:i+seqLen] for i in ix])
+        y = np.stack([mem[i+1:i+seqLen+1] for i in ix])
+
+        x = torch.from_numpy(x).to(device).long()
+        y = torch.from_numpy(y).to(device).long()
+
+        _, loss = model(x,y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        pbar.set_postfix(loss=f"{loss.item():.3f}")
+        pbar.update(1)
+
+    pbar.close()
+
+    # save weights
+    model.emb.weight.detach().cpu().numpy().tofile(weightsDir/"embed.bin")
+    model.head.weight.detach().cpu().numpy().tofile(weightsDir/"lmHead.bin")
+    model.head.bias.detach().cpu().numpy().tofile(weightsDir/"lmHeadBias.bin")
+
+    print("training done")
+
+if __name__ == "__main__":
+    main()

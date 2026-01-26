@@ -6,6 +6,8 @@ from datasets import load_dataset
 outPath = os.path.join(os.path.dirname(__file__), "..", "data", "train.txt")
 os.makedirs(os.path.dirname(outPath), exist_ok=True)
 
+MAX_LINES = 80000
+
 def cleanLine(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
 
@@ -15,22 +17,40 @@ def cleanLine(s: str) -> str:
     s = s.replace("\u2026", "...")
 
     s = re.sub(r"[\u0000-\u001f\u007f-\u009f]", " ", s)
-
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-ds = load_dataset("wikitext", "wikitext-2-raw-v1")
-lines = ds["train"]["text"]
+datasetsToLoad = [
+    ("wikitext", "wikitext-2-raw-v1"),
+    ("roneneldan/TinyStories", None),
+    ("openwebtext", None),
+]
+
+lineCount = 0
 
 with open(outPath, "w", encoding="utf-8") as f:
-    for line in lines:
-        line = cleanLine(line)
-        if len(line) == 0:
-            continue
+    for name, subset in datasetsToLoad:
+        if name == "wikitext":
+            ds = load_dataset(name, subset, split="train", streaming=True)
+        else:
+            ds = load_dataset(name, split="train", streaming=True)
 
-        if re.match(r"^=+ .* =+$", line):
-            continue
+        for ex in ds:
+            line = ex["text"]
+            line = cleanLine(line)
+            if len(line) == 0:
+                continue
 
-        f.write(line + "\n")
+            if re.match(r"^=+ .* =+$", line):
+                continue
 
-print("saved:", outPath)
+            f.write(line + "\n")
+            lineCount += 1
+
+            if lineCount >= MAX_LINES:
+                break
+
+        if lineCount >= MAX_LINES:
+            break
+
+print("saved:", outPath, "lines:", lineCount)
