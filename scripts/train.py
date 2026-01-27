@@ -31,10 +31,6 @@ weightsDir = rootDir / "weights"
 weightsDir.mkdir(exist_ok=True)
 (rootDir / "data").mkdir(exist_ok=True)
 
-# -----------------------------
-# Model
-# -----------------------------
-
 class rmsNorm(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -95,9 +91,7 @@ class tinyLM(nn.Module):
         return logits, loss
 
 
-# -----------------------------
-# Token Encoding
-# -----------------------------
+
 
 def buildTokens(reencode):
     if tokensPath.exists() and not reencode:

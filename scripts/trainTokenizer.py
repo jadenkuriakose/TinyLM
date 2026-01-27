@@ -224,7 +224,7 @@ def main():
 
     for step in range(1, steps + 1):
         x, y = sampleBatch(mem, batchSize, seqLen, device)
-        _, loss = model(x, y)
+        i, loss = model(x, y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
