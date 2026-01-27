@@ -66,6 +66,7 @@ Example usage:
 
 ```bash
 ./SLM "prompt" tokens
+```
 
 ## Future Improvements 
 
