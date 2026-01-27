@@ -66,3 +66,10 @@ Example usage:
 
 ```bash
 ./SLM "prompt" tokens
+
+## Future Improvements 
+
+
+- gRPC 
+- Docker based dashboard
+- Benchmarking against ONNX Runtime 
