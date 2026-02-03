@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package slm;
+
+service SlmService {
+  rpc generate (GenerateRequest) returns (GenerateResponse);
+}
+
+message GenerateRequest {
+  string prompt = 1;
+  int32 maxNew = 2;
+}
+
+message GenerateResponse {
+  string text = 1;
+}

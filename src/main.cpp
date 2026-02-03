@@ -5,11 +5,19 @@
 
 using namespace std;
 
+void runGrpcServer();
+
 int main(int argc, char** argv) {
     srand(42);
 
+    if (argc >= 2 && string(argv[1]) == "--grpc") {
+        runGrpcServer();
+        return 0;
+    }
+
     if (argc < 3) {
-        cout << "./SLM \"prompt\" maxNew\n";
+        cout << "./slm \"prompt\" maxNew\n";
+        cout << "./slm --grpc\n";
         return 1;
     }
 
